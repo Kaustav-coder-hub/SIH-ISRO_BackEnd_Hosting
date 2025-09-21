@@ -43,7 +43,7 @@ if os.environ.get('FLASK_ENV') == 'production':
     # Add your frontend URLs here when deployed
     CORS(app, origins=[
         "http://localhost:5173",  # Local development
-        "https://your-frontend-domain.vercel.app",  # Add your actual frontend URL
+        "https://sih-isro-frontend-hosting.onrender.com",  # Add your actual frontend URL
         "https://your-frontend-domain.netlify.app"   # Add your actual frontend URL
     ])
 else:
