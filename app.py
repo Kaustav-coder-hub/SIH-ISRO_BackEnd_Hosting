@@ -1,7 +1,20 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import os
-from inference import analyze_location
+
+# Use Railway-optimized inference for deployment
+try:
+    from inference_railway import analyze_location
+    print("✅ Using Railway-optimized inference")
+except ImportError:
+    try:
+        from inference import analyze_location
+        print("⚠️ Using standard inference (may have memory issues on Railway)")
+    except ImportError:
+        print("❌ No inference module found")
+        def analyze_location(*args, **kwargs):
+            return {'error': 'Inference module not available', 'status': 'error'}
+
 from database import save_graph, get_saved_graphs, get_graph_by_id, delete_graph
 
 app = Flask(__name__)

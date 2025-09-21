@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: sih-isro-backend
+    env: python
+    plan: free
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app --timeout 300 --workers 1
+    healthCheckPath: /api/status
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: PYTHONPATH
+        value: /opt/render/project/src
