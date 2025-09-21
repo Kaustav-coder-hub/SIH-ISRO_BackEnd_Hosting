@@ -1,0 +1,8 @@
+Flask==3.0.3
+flask-cors==4.0.0
+gunicorn==22.0.0
+Pillow==10.0.1
+numpy==1.24.3
+requests==2.31.0
+# Removed: opencv-python-headless (49MB), scikit-image (80MB)
+# Use Pillow for basic image operations instead

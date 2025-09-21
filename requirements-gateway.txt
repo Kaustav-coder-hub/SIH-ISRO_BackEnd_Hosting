@@ -1,0 +1,6 @@
+Flask==3.0.3
+flask-cors==4.0.0
+gunicorn==22.0.0
+Pillow==10.0.1
+requests==2.31.0
+# Lightweight gateway - no ML dependencies!
