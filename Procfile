@@ -1,1 +1,1 @@
-web: python app_minimal.py
+web: gunicorn app_minimal:app --host 0.0.0.0 --port $PORT
