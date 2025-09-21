@@ -1,23 +1,42 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import os
+import sys
+import traceback
+
+print("🚀 Starting Railway deployment...")
+print(f"🐍 Python version: {sys.version}")
+print(f"📁 Current directory: {os.getcwd()}")
+print(f"🌐 PORT environment variable: {os.environ.get('PORT', 'Not set')}")
 
 # Use Railway-optimized inference for deployment
 try:
     from inference_railway import analyze_location
     print("✅ Using Railway-optimized inference")
-except ImportError:
+except ImportError as e:
+    print(f"❌ Failed to import inference_railway: {e}")
     try:
         from inference import analyze_location
         print("⚠️ Using standard inference (may have memory issues on Railway)")
-    except ImportError:
+    except ImportError as e2:
+        print(f"❌ Failed to import inference: {e2}")
         print("❌ No inference module found")
         def analyze_location(*args, **kwargs):
             return {'error': 'Inference module not available', 'status': 'error'}
 
-from database import save_graph, get_saved_graphs, get_graph_by_id, delete_graph
+try:
+    from database import save_graph, get_saved_graphs, get_graph_by_id, delete_graph
+    print("✅ Database module imported successfully")
+except ImportError as e:
+    print(f"❌ Failed to import database: {e}")
+    # Create dummy functions if database import fails
+    def save_graph(*args, **kwargs): return None
+    def get_saved_graphs(*args, **kwargs): return []
+    def get_graph_by_id(*args, **kwargs): return None
+    def delete_graph(*args, **kwargs): return None
 
 app = Flask(__name__)
+print("✅ Flask app created")
 
 # Production CORS configuration
 if os.environ.get('FLASK_ENV') == 'production':
@@ -245,6 +264,14 @@ def delete_saved_graph(graph_id):
         }), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('FLASK_ENV') != 'production'
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    try:
+        port = int(os.environ.get('PORT', 5000))
+        debug = os.environ.get('FLASK_ENV') != 'production'
+        print(f"🚀 Starting Flask server on 0.0.0.0:{port}")
+        print(f"🐛 Debug mode: {debug}")
+        app.run(host='0.0.0.0', port=port, debug=debug)
+    except Exception as e:
+        print(f"❌ Failed to start Flask server: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
