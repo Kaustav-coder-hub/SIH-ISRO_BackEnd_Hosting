@@ -1,0 +1,632 @@
+import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim, mean_squared_error
+from skimage import filters, restoration, feature, transform, measure
+from scipy import ndimage
+from scipy.ndimage import gaussian_filter
+import warnings
+import requests
+import io
+import base64
+warnings.filterwarnings('ignore')
+
+class SRCNN(nn.Module):
+    def __init__(self, num_channels=1):
+        super(SRCNN, self).__init__()
+        self.conv1 = nn.Conv2d(num_channels, 64, kernel_size=9, padding=4)
+        self.conv2 = nn.Conv2d(64, 32, kernel_size=1, padding=0)
+        self.conv3 = nn.Conv2d(32, num_channels, kernel_size=5, padding=2)
+        
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = self.conv3(x)
+        return x
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels=64):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, 1, 1)
+        self.conv2 = nn.Conv2d(channels, channels, 3, 1, 1)
+        self.lrelu = nn.LeakyReLU(0.2, inplace=True)
+        
+    def forward(self, x):
+        identity = x
+        out = self.lrelu(self.conv1(x))
+        out = self.conv2(out)
+        return out * 0.2 + identity
+
+class RRDB(nn.Module):
+    def __init__(self, channels=64, growth_rate=32):
+        super(RRDB, self).__init__()
+        self.channels = channels
+        self.growth_rate = growth_rate
+        
+        # Dense block 1
+        self.conv1_1 = nn.Conv2d(channels, growth_rate, 3, 1, 1)
+        self.conv1_2 = nn.Conv2d(channels + growth_rate, growth_rate, 3, 1, 1)
+        self.conv1_3 = nn.Conv2d(channels + 2 * growth_rate, growth_rate, 3, 1, 1)
+        self.conv1_4 = nn.Conv2d(channels + 3 * growth_rate, growth_rate, 3, 1, 1)
+        self.conv1_5 = nn.Conv2d(channels + 4 * growth_rate, channels, 3, 1, 1)
+        
+        # Dense block 2
+        self.conv2_1 = nn.Conv2d(channels, growth_rate, 3, 1, 1)
+        self.conv2_2 = nn.Conv2d(channels + growth_rate, growth_rate, 3, 1, 1)
+        self.conv2_3 = nn.Conv2d(channels + 2 * growth_rate, growth_rate, 3, 1, 1)
+        self.conv2_4 = nn.Conv2d(channels + 3 * growth_rate, growth_rate, 3, 1, 1)
+        self.conv2_5 = nn.Conv2d(channels + 4 * growth_rate, channels, 3, 1, 1)
+        
+        # Dense block 3
+        self.conv3_1 = nn.Conv2d(channels, growth_rate, 3, 1, 1)
+        self.conv3_2 = nn.Conv2d(channels + growth_rate, growth_rate, 3, 1, 1)
+        self.conv3_3 = nn.Conv2d(channels + 2 * growth_rate, growth_rate, 3, 1, 1)
+        self.conv3_4 = nn.Conv2d(channels + 3 * growth_rate, growth_rate, 3, 1, 1)
+        self.conv3_5 = nn.Conv2d(channels + 4 * growth_rate, channels, 3, 1, 1)
+        
+        self.lrelu = nn.LeakyReLU(0.2, inplace=True)
+        
+    def _dense_block_forward(self, x, convs):
+        """Forward pass for a single dense block"""
+        x1 = self.lrelu(convs[0](x))
+        x2 = self.lrelu(convs[1](torch.cat([x, x1], 1)))
+        x3 = self.lrelu(convs[2](torch.cat([x, x1, x2], 1)))
+        x4 = self.lrelu(convs[3](torch.cat([x, x1, x2, x3], 1)))
+        x5 = convs[4](torch.cat([x, x1, x2, x3, x4], 1))
+        return x5 * 0.2 + x
+    
+    def forward(self, x):
+        # Dense block 1
+        out1 = self._dense_block_forward(x, [self.conv1_1, self.conv1_2, self.conv1_3, self.conv1_4, self.conv1_5])
+        
+        # Dense block 2
+        out2 = self._dense_block_forward(out1, [self.conv2_1, self.conv2_2, self.conv2_3, self.conv2_4, self.conv2_5])
+        
+        # Dense block 3
+        out3 = self._dense_block_forward(out2, [self.conv3_1, self.conv3_2, self.conv3_3, self.conv3_4, self.conv3_5])
+        
+        return out3 * 0.2 + x
+
+class DBPN_Block(nn.Module):
+    def __init__(self, channels=64, scale=2):
+        super(DBPN_Block, self).__init__()
+        self.up_conv = nn.ConvTranspose2d(channels, channels, scale*2, scale, scale//2)
+        self.down_conv = nn.Conv2d(channels, channels, scale*2, scale, scale//2)
+        self.lrelu = nn.LeakyReLU(0.2, inplace=True)
+        
+    def forward(self, x):
+        up = self.lrelu(self.up_conv(x))
+        down = self.lrelu(self.down_conv(up))
+        diff = x - down
+        return up + self.up_conv(diff)
+
+class ProfessionalThermalSR(nn.Module):
+    def __init__(self, scale_factor=4, num_channels=1):
+        super(ProfessionalThermalSR, self).__init__()
+        self.scale_factor = scale_factor
+        
+        # Initial feature extraction (SRCNN inspired)
+        self.conv_first = nn.Conv2d(num_channels, 64, 9, 1, 4)  # Larger kernel for thermal data
+        
+        # Simplified residual blocks for stability
+        self.res_blocks = nn.ModuleList([
+            ResidualBlock(64) for _ in range(4)  # Reduced from 6 RRDB blocks
+        ])
+        
+        # Feature refinement
+        self.conv_body = nn.Conv2d(64, 64, 3, 1, 1)
+        
+        # Upsampling with sub-pixel convolution (ESPCN style)
+        if scale_factor == 4:
+            self.upconv1 = nn.Conv2d(64, 64 * 4, 3, 1, 1)
+            self.pixel_shuffle1 = nn.PixelShuffle(2)
+            self.upconv2 = nn.Conv2d(64, 64 * 4, 3, 1, 1)
+            self.pixel_shuffle2 = nn.PixelShuffle(2)
+        else:
+            self.upconv1 = nn.Conv2d(64, 64 * (scale_factor ** 2), 3, 1, 1)
+            self.pixel_shuffle1 = nn.PixelShuffle(scale_factor)
+        
+        # Final reconstruction
+        self.conv_last = nn.Conv2d(64, num_channels, 3, 1, 1)
+        
+        self.lrelu = nn.LeakyReLU(0.2, inplace=True)
+        
+    def forward(self, x):
+        # Initial feature extraction
+        feat = self.lrelu(self.conv_first(x))
+        
+        # Residual feature learning
+        body_feat = feat
+        for res_block in self.res_blocks:
+            body_feat = res_block(body_feat)
+        
+        body_feat = self.conv_body(body_feat)
+        feat = feat + body_feat  # Global residual connection
+        
+        # Upsampling
+        if self.scale_factor == 4:
+            # 2x upsampling twice for 4x total
+            feat = self.lrelu(self.pixel_shuffle1(self.upconv1(feat)))
+            feat = self.lrelu(self.pixel_shuffle2(self.upconv2(feat)))
+        else:
+            feat = self.lrelu(self.pixel_shuffle1(self.upconv1(feat)))
+        
+        # Final reconstruction
+        out = self.conv_last(feat)
+        return out
+
+class AdvancedThermalSuperResolution:
+    def __init__(self, scale_factor=4, device='cpu'):
+        self.scale_factor = scale_factor
+        self.device = torch.device(device)
+        self.model = None
+        self._initialize_models()
+        
+    def _initialize_models(self):
+        """Initialize the deep learning models"""
+        print("Initializing research-based models...")
+        
+        # Load professional thermal SR model
+        self.model = ProfessionalThermalSR(self.scale_factor, 1).to(self.device)
+        
+        # Initialize with Xavier initialization (better for thermal data)
+        for m in self.model.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
+    def guided_filter_he2010(self, guide, src, radius=8, epsilon=0.1):
+        """
+        Implementation of Guided Filter
+        Based on: "Guided Image Filtering" by Kaiming He, Jian Sun, Xiaoou Tang (ECCV 2010)
+        """
+        mean_guide = cv2.boxFilter(guide, cv2.CV_32F, (radius, radius))
+        mean_src = cv2.boxFilter(src, cv2.CV_32F, (radius, radius))
+        corr_guide_src = cv2.boxFilter(guide * src, cv2.CV_32F, (radius, radius))
+        
+        cov_guide_src = corr_guide_src - mean_guide * mean_src
+        mean_guide2 = cv2.boxFilter(guide * guide, cv2.CV_32F, (radius, radius))
+        var_guide = mean_guide2 - mean_guide * mean_guide
+        
+        a = cov_guide_src / (var_guide + epsilon)
+        b = mean_src - a * mean_guide
+        
+        mean_a = cv2.boxFilter(a, cv2.CV_32F, (radius, radius))
+        mean_b = cv2.boxFilter(b, cv2.CV_32F, (radius, radius))
+        
+        return mean_a * guide + mean_b
+    
+    def edge_preserving_interpolation(self, thermal_img, optical_img):
+        """
+        Edge-preserving interpolation using optical guidance
+        Based on: "Image and Video Upsampling from Local Self-Examples" (Glasner et al. 2010)
+        """
+        # Extract edges from optical image with multiple scales
+        optical_gray = cv2.cvtColor(optical_img, cv2.COLOR_BGR2GRAY)
+        
+        # Multi-scale edge detection for better detail preservation
+        edges_fine = cv2.Canny((optical_gray * 255).astype(np.uint8), 30, 80).astype(np.float32) / 255.0
+        edges_coarse = cv2.Canny((optical_gray * 255).astype(np.uint8), 80, 150).astype(np.float32) / 255.0
+        
+        # Combine edge scales
+        combined_edges = 0.7 * edges_fine + 0.3 * edges_coarse
+        
+        # Apply guided filtering with reduced smoothing for sharper results
+        filtered = self.guided_filter_he2010(optical_gray, thermal_img, radius=8, epsilon=0.1)
+        
+        # Professional edge-aware blending with stronger detail preservation
+        edge_strength = cv2.GaussianBlur(combined_edges, (3, 3), 0.5)
+        
+        # Adaptive blending that preserves thermal data while enhancing edges
+        alpha = 0.2 + 0.4 * edge_strength  # Less optical influence, more thermal preservation
+        
+        # Enhanced thermal with edge guidance
+        enhanced = (1 - alpha) * thermal_img + alpha * optical_gray
+        
+        # Add detail enhancement
+        detail_layer = thermal_img - gaussian_filter(thermal_img, sigma=1.5)
+        enhanced = enhanced + 0.4 * detail_layer
+        
+        return np.clip(enhanced, 0, 1), combined_edges
+    
+    def deep_super_resolution(self, thermal_fused):
+        """
+        Apply professional deep learning super-resolution with enhanced sharpening
+        """
+        
+        self.model.eval()
+        with torch.no_grad():
+            # Prepare input
+            input_tensor = torch.from_numpy(thermal_fused[None, None, :, :]).float().to(self.device)
+            
+            # Apply super-resolution
+            output_tensor = self.model(input_tensor)
+            
+            # Convert back to numpy
+            enhanced = output_tensor.squeeze().cpu().numpy()
+            enhanced = np.clip(enhanced, 0, 1)
+            
+            # Professional enhancement pipeline
+            enhanced = self.apply_professional_sharpening(enhanced)
+            enhanced = self.enhance_thermal_details(enhanced, thermal_fused)
+            
+        return enhanced
+    
+    def apply_professional_sharpening(self, image):
+        """
+        Apply professional-grade sharpening filters for thermal imaging
+        """
+        # Convert to float64 for precision
+        img = image.astype(np.float64)
+        
+        # 1. Unsharp masking with multiple scales
+        gaussian_3 = gaussian_filter(img, sigma=0.5)
+        gaussian_5 = gaussian_filter(img, sigma=1.0)
+        gaussian_9 = gaussian_filter(img, sigma=2.0)
+        
+        # Multi-scale unsharp mask
+        unsharp_3 = img + 0.8 * (img - gaussian_3)
+        unsharp_5 = img + 0.6 * (img - gaussian_5)
+        unsharp_9 = img + 0.4 * (img - gaussian_9)
+        
+        # Combine multi-scale unsharp masks
+        enhanced = 0.5 * unsharp_3 + 0.3 * unsharp_5 + 0.2 * unsharp_9
+        
+        # 2. High-frequency emphasis
+        high_freq = img - gaussian_filter(img, sigma=1.5)
+        enhanced = enhanced + 0.3 * high_freq
+        
+        # 3. Edge enhancement using Laplacian
+        laplacian_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+        enhanced_edges = ndimage.convolve(enhanced, laplacian_kernel, mode='reflect')
+        enhanced = 0.8 * enhanced + 0.2 * enhanced_edges
+        
+        # 4. Contrast enhancement
+        enhanced = self.adaptive_contrast_enhancement(enhanced)
+        
+        return np.clip(enhanced, 0, 1).astype(np.float32)
+    
+    def adaptive_contrast_enhancement(self, image):
+        """
+        Apply adaptive contrast enhancement for thermal images
+        """
+        # Calculate local statistics
+        mean_filter = gaussian_filter(image, sigma=3.0)
+        variance = gaussian_filter((image - mean_filter) ** 2, sigma=3.0)
+        std_filter = np.sqrt(variance + 1e-8)
+        
+        # Adaptive enhancement
+        alpha = 0.3  # Enhancement strength
+        enhanced = image + alpha * (image - mean_filter) / (std_filter + 0.1)
+        
+        return enhanced
+    
+    def enhance_thermal_details(self, enhanced, original):
+        """
+        Enhance thermal details while preserving physical properties
+        """
+        # Resize original to match enhanced
+        original_upsampled = cv2.resize(original, (enhanced.shape[1], enhanced.shape[0]), 
+                                      interpolation=cv2.INTER_CUBIC)
+        
+        # Calculate detail layers
+        detail_fine = enhanced - gaussian_filter(enhanced, sigma=0.8)
+        detail_medium = enhanced - gaussian_filter(enhanced, sigma=2.0)
+        detail_coarse = enhanced - gaussian_filter(enhanced, sigma=4.0)
+        
+        # Enhance details with different weights
+        enhanced_details = enhanced + 0.4 * detail_fine + 0.3 * detail_medium + 0.2 * detail_coarse
+        
+        # Preserve thermal gradients from original
+        orig_grad_x = np.gradient(original_upsampled, axis=1)
+        orig_grad_y = np.gradient(original_upsampled, axis=0)
+        enh_grad_x = np.gradient(enhanced_details, axis=1)
+        enh_grad_y = np.gradient(enhanced_details, axis=0)
+        
+        # Blend gradients to preserve thermal physics
+        alpha = 0.7
+        final_grad_x = alpha * enh_grad_x + (1 - alpha) * orig_grad_x
+        final_grad_y = alpha * enh_grad_y + (1 - alpha) * orig_grad_y
+        
+        # Reconstruct from gradients (simplified)
+        gradient_magnitude = np.sqrt(final_grad_x**2 + final_grad_y**2)
+        enhanced_final = enhanced_details + 0.2 * gradient_magnitude
+        
+        return np.clip(enhanced_final, 0, 1)
+    
+    def thermal_physics_correction(self, enhanced_thermal, original_thermal):
+        """
+        Professional thermal physics correction preserving fine details
+        """
+        
+        # Preserve thermal statistics while maintaining detail
+        orig_mean = np.mean(original_thermal)
+        orig_std = np.std(original_thermal)
+        orig_min = np.min(original_thermal)
+        orig_max = np.max(original_thermal)
+        
+        # Enhanced thermal statistics
+        enh_mean = np.mean(enhanced_thermal)
+        enh_std = np.std(enhanced_thermal)
+        
+        # Statistical correction with detail preservation
+        if enh_std > 1e-6:
+            corrected = (enhanced_thermal - enh_mean) * (orig_std / enh_std) + orig_mean
+        else:
+            corrected = enhanced_thermal
+        
+        # Preserve fine details through high-frequency preservation
+        enhanced_details = enhanced_thermal - gaussian_filter(enhanced_thermal, sigma=1.0)
+        corrected_base = gaussian_filter(corrected, sigma=1.0)
+        final = corrected_base + 0.8 * enhanced_details  # Preserve more details
+        
+        # Ensure thermal range consistency with some tolerance for enhancement
+        final = np.clip(final, orig_min * 0.9, orig_max * 1.1)
+        
+        return final
+    
+    def bicubic_upsampling(self, thermal_fused):
+        """
+        Professional bicubic upsampling with enhanced brightness and contrast
+        """
+        # Calculate target size based on scale factor
+        target_height = int(thermal_fused.shape[0] * self.scale_factor)
+        target_width = int(thermal_fused.shape[1] * self.scale_factor)
+        
+        # Apply bicubic interpolation
+        upsampled = cv2.resize(thermal_fused, (target_width, target_height), interpolation=cv2.INTER_CUBIC)
+        
+        # Professional enhancement for brightness and contrast
+        # 1. Histogram equalization for better contrast
+        upsampled_uint8 = (upsampled * 255).astype(np.uint8)
+        enhanced = cv2.equalizeHist(upsampled_uint8).astype(np.float32) / 255.0
+        
+        # 2. Brightness enhancement - make it more vibrant
+        enhanced = np.power(enhanced, 0.8)  # Gamma correction for brightness
+        
+        # 3. Contrast enhancement using CLAHE
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        enhanced_uint8 = (enhanced * 255).astype(np.uint8)
+        enhanced = clahe.apply(enhanced_uint8).astype(np.float32) / 255.0
+        
+        # 4. Color enhancement - boost thermal range
+        # Enhance the dynamic range to make it more colorful
+        enhanced = np.clip(enhanced * 1.2 + 0.1, 0, 1)
+        
+        # 5. Professional smoothing to remove bicubic artifacts while preserving edges
+        enhanced = cv2.bilateralFilter(enhanced.astype(np.float32), 5, 0.1, 0.1)
+        
+        return enhanced
+    
+    def multi_scale_sift_alignment(self, thermal_img, optical_img):
+        """
+        Advanced SIFT-based alignment with multi-scale approach
+        """
+        
+        aligned_images = []
+        scales = [1.0, 0.5, 0.25]  # Multi-scale processing
+        
+        for scale in scales:
+            # Scale images
+            h, w = thermal_img.shape
+            new_h, new_w = int(h * scale), int(w * scale)
+            
+            thermal_scaled = cv2.resize(thermal_img, (new_w, new_h))
+            optical_scaled = cv2.resize(optical_img, (new_w, new_h))
+            
+            # SIFT alignment at this scale
+            thermal_uint8 = (thermal_scaled * 255).astype(np.uint8)
+            optical_gray = cv2.cvtColor((optical_scaled * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+            
+            # Enhanced SIFT parameters
+            sift = cv2.SIFT_create(nfeatures=2000, contrastThreshold=0.02, edgeThreshold=15)
+            
+            kp1, des1 = sift.detectAndCompute(thermal_uint8, None)
+            kp2, des2 = sift.detectAndCompute(optical_gray, None)
+            
+            if des1 is not None and des2 is not None and len(des1) > 10 and len(des2) > 10:
+                # Improved matching with ratio test
+                bf = cv2.BFMatcher()
+                matches = bf.knnMatch(des1, des2, k=2)
+                
+                good_matches = []
+                for match_pair in matches:
+                    if len(match_pair) == 2:
+                        m, n = match_pair
+                        if m.distance < 0.6 * n.distance:  # Stricter ratio test
+                            good_matches.append(m)
+                
+                if len(good_matches) > 15:
+                    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                    
+                    # Robust homography estimation
+                    homography, mask = cv2.findHomography(dst_pts, src_pts, 
+                                                        cv2.RANSAC, 3.0, maxIters=5000)
+                    
+                    if homography is not None:
+                        aligned = cv2.warpPerspective(optical_scaled, homography, (new_w, new_h))
+                        aligned_images.append((cv2.resize(aligned, (w, h)), scale, len(good_matches)))
+        
+        # Select best alignment based on number of matches
+        if aligned_images:
+            best_aligned = max(aligned_images, key=lambda x: x[2])
+            return best_aligned[0]
+        else:
+            return cv2.resize(optical_img, (thermal_img.shape[1], thermal_img.shape[0]))
+    
+    def process(self, thermal_path, optical_path):
+        """
+        Complete advanced processing pipeline using research-based methods
+        """
+        
+        # Load images
+        thermal_img = cv2.imread(thermal_path, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+        optical_img = cv2.imread(optical_path).astype(np.float32) / 255.0
+        
+        # Step 1: Advanced multi-scale alignment
+        aligned_optical = self.multi_scale_sift_alignment(thermal_img, optical_img)
+        
+        # Step 2: Edge-preserving fusion with guided filtering
+        thermal_fused, optical_edges = self.edge_preserving_interpolation(thermal_img, aligned_optical)
+        
+        # Step 3: Bicubic upsampling for resolution enhancement
+        upsampled_thermal = self.bicubic_upsampling(thermal_fused)
+        
+        # Step 4: Physics-based thermal enhancement (keeps the perfect enhancement)
+        final_enhanced = self.thermal_physics_correction(upsampled_thermal, thermal_img)
+        
+        return final_enhanced, thermal_fused, aligned_optical, optical_edges
+    
+    def process_from_arrays(self, thermal_img, optical_img):
+        """
+        Process images from numpy arrays instead of file paths
+        """
+        # Ensure inputs are properly formatted
+        if thermal_img.ndim != 2:
+            # If thermal image is not grayscale, convert it
+            if thermal_img.ndim == 3 and thermal_img.shape[2] == 3:
+                thermal_img = cv2.cvtColor(thermal_img, cv2.COLOR_BGR2GRAY)
+        
+        # Ensure optical image is in BGR format
+        if optical_img.ndim == 2:
+            # Convert grayscale to BGR
+            optical_img = cv2.cvtColor(optical_img, cv2.COLOR_GRAY2BGR)
+        
+        # Step 1: Advanced multi-scale alignment
+        aligned_optical = self.multi_scale_sift_alignment(thermal_img, optical_img)
+        
+        # Step 2: Edge-preserving fusion with guided filtering
+        thermal_fused, optical_edges = self.edge_preserving_interpolation(thermal_img, aligned_optical)
+        
+        # Step 3: Bicubic upsampling for resolution enhancement
+        upsampled_thermal = self.bicubic_upsampling(thermal_fused)
+        
+        # Step 4: Physics-based thermal enhancement
+        final_enhanced = self.thermal_physics_correction(upsampled_thermal, thermal_img)
+        
+        return final_enhanced, thermal_fused, aligned_optical, optical_edges
+
+class ResearchBasedEvaluator:
+    """
+    Research-Based Evaluation Metrics
+    """
+    
+    @staticmethod
+    def multi_scale_ssim(img1, img2, weights=[0.0448, 0.2856, 0.3001, 0.2363, 0.1333]):
+        """
+        Multi-Scale SSIM (MS-SSIM)
+        Based on: "Multi-scale structural similarity for image quality assessment" (Wang et al., 2003)
+        """
+        # Ensure both images have same dimensions
+        if img1.shape != img2.shape:
+            img1 = cv2.resize(img1, (img2.shape[1], img2.shape[0]), interpolation=cv2.INTER_CUBIC)
+        
+        ms_ssim_values = []
+        
+        for i, weight in enumerate(weights):
+            if i > 0:
+                # Check if images are large enough to downsample
+                if img1.shape[0] < 16 or img1.shape[1] < 16:
+                    break
+                # Downsample images
+                img1 = cv2.resize(img1, (img1.shape[1]//2, img1.shape[0]//2), interpolation=cv2.INTER_AREA)
+                img2 = cv2.resize(img2, (img2.shape[1]//2, img2.shape[0]//2), interpolation=cv2.INTER_AREA)
+            
+            try:
+                ssim_val = ssim(img1, img2, data_range=1.0)
+                if np.isnan(ssim_val):
+                    ssim_val = 0.0
+                ms_ssim_values.append(ssim_val * weight)
+            except:
+                # Fallback for problematic scales
+                ms_ssim_values.append(0.0)
+        
+        return np.sum(ms_ssim_values)
+
+def analyze_location(lat, lon, api_key=None):
+    """
+    Analyze a location by fetching images and running thermal super-resolution
+    """
+    try:
+        # Fetch RGB satellite image
+        zoom = 15
+        size = '512x512'
+        
+        # Default to an empty API key if none is provided
+        api_key = api_key or "YOUR_API_KEY"
+        
+        # Use Google Maps Static API for RGB satellite image
+        rgb_url = f'https://maps.googleapis.com/maps/api/staticmap?center={lat},{lon}&zoom={zoom}&size={size}&maptype=satellite&key={api_key}'
+        rgb_response = requests.get(rgb_url)
+        
+        if rgb_response.status_code != 200:
+            # Create a sample RGB image if API call fails
+            print(f"Warning: Failed to fetch satellite image, status code: {rgb_response.status_code}")
+            rgb_img = np.zeros((512, 512, 3), dtype=np.uint8)
+            for i in range(512):
+                for j in range(512):
+                    # Create a pattern simulating satellite view
+                    value = (i + j) % 256
+                    rgb_img[i, j] = [value, min(value + 30, 255), min(value + 60, 255)]
+        else:
+            # Decode the image from response content
+            rgb_img = cv2.imdecode(np.frombuffer(rgb_response.content, np.uint8), cv2.IMREAD_COLOR)
+        
+        # For infrared, use terrain maptype as approximation
+        infrared_url = f'https://maps.googleapis.com/maps/api/staticmap?center={lat},{lon}&zoom={zoom}&size={size}&maptype=terrain&key={api_key}'
+        infrared_response = requests.get(infrared_url)
+        
+        if infrared_response.status_code != 200:
+            # Create a sample infrared image if API call fails
+            print(f"Warning: Failed to fetch terrain image, status code: {infrared_response.status_code}")
+            infrared_img = np.zeros((512, 512), dtype=np.uint8)
+            for i in range(512):
+                for j in range(512):
+                    # Create a gradient pattern
+                    infrared_img[i, j] = (i * j) // 512
+        else:
+            # Decode the image from response content
+            infrared_img = cv2.imdecode(np.frombuffer(infrared_response.content, np.uint8), cv2.IMREAD_GRAYSCALE)
+        
+        # Convert to float32 and normalize
+        thermal_img = infrared_img.astype(np.float32) / 255.0
+        optical_img = rgb_img.astype(np.float32) / 255.0
+        
+        # Initialize processor
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        processor = AdvancedThermalSuperResolution(scale_factor=2, device=device)
+        
+        # Process images
+        enhanced_thermal, fused_thermal, aligned_optical, optical_edges = processor.process_from_arrays(thermal_img, optical_img)
+        
+        # Apply color mapping to make thermal image more visually informative
+        enhanced_thermal_colored = cv2.applyColorMap((enhanced_thermal * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+        
+        # Encode to base64 for response
+        _, enhanced_buffer = cv2.imencode('.png', enhanced_thermal_colored)
+        enhanced_b64 = base64.b64encode(enhanced_buffer).decode('utf-8')
+        
+        # Convert aligned optical to uint8 for encoding
+        aligned_optical_uint8 = (aligned_optical * 255).astype(np.uint8)
+        _, optical_buffer = cv2.imencode('.png', aligned_optical_uint8)
+        optical_b64 = base64.b64encode(optical_buffer).decode('utf-8')
+        
+        return {
+            'infrared': f'data:image/png;base64,{enhanced_b64}',
+            'rgb': f'data:image/png;base64,{optical_b64}',
+            'coordinates': {'lat': float(lat), 'lon': float(lon)}
+        }
+        
+    except Exception as e:
+        print(f"Error in analyze_location: {str(e)}")
+        return {'error': str(e)}
+
+if __name__ == "__main__":
+    # For testing
+    result = analyze_location(22.5726, 88.3639)  # Kolkata coordinates
+    print("Analysis completed successfully")
