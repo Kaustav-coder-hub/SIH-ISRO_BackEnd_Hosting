@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "gunicorn --bind 0.0.0.0:$PORT app:app --timeout 300 --workers 1 --max-requests 100 --memory-limit 800",
+    "startCommand": "gunicorn --bind 0.0.0.0:$PORT app:app --workers 1 --timeout 300",
     "healthcheckPath": "/api/status"
   }
 }
