@@ -5,7 +5,17 @@ from inference import analyze_location
 from database import save_graph, get_saved_graphs, get_graph_by_id, delete_graph
 
 app = Flask(__name__)
-CORS(app)
+
+# Production CORS configuration
+if os.environ.get('FLASK_ENV') == 'production':
+    # Add your frontend URLs here when deployed
+    CORS(app, origins=[
+        "http://localhost:5173",  # Local development
+        "https://your-frontend-domain.vercel.app",  # Add your actual frontend URL
+        "https://your-frontend-domain.netlify.app"   # Add your actual frontend URL
+    ])
+else:
+    CORS(app)  # Allow all origins in development
 
 @app.route('/')
 def hello():
@@ -222,4 +232,6 @@ def delete_saved_graph(graph_id):
         }), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('FLASK_ENV') != 'production'
+    app.run(host='0.0.0.0', port=port, debug=debug)

@@ -1,0 +1,13 @@
+# Lightweight requirements for free hosting
+Flask==2.3.3
+flask-cors==4.0.0
+opencv-python-headless==4.8.1.78  # Smaller version
+torch==2.1.0+cpu  # CPU-only version (smaller)
+torchvision==0.16.0+cpu
+numpy==1.24.3
+matplotlib==3.7.2
+scikit-image==0.21.0
+scipy==1.11.3
+requests==2.31.0
+gunicorn==21.2.0
+Pillow==10.0.1
