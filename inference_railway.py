@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 # import matplotlib.pyplot as plt  # Will comment out for Railway
-from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim, mean_squared_error
+# from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim, mean_squared_error
 # from skimage import filters, restoration, feature, transform, measure  # Reduced imports
 # from scipy import ndimage  # Comment out scipy
 # from scipy.ndimage import gaussian_filter  # Comment out scipy
@@ -10,6 +10,46 @@ import requests
 import base64
 import io
 warnings.filterwarnings('ignore')
+
+# Lightweight metric functions without scikit-image
+def calculate_psnr(img1, img2):
+    """Calculate PSNR using only numpy"""
+    mse = np.mean((img1 - img2) ** 2)
+    if mse == 0:
+        return float('inf')
+    max_pixel = 255.0
+    psnr_val = 20 * np.log10(max_pixel / np.sqrt(mse))
+    return psnr_val
+
+def calculate_ssim_simple(img1, img2):
+    """Simplified SSIM calculation using OpenCV"""
+    # Convert to grayscale if needed
+    if len(img1.shape) == 3:
+        img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+    if len(img2.shape) == 3:
+        img2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+    
+    # Simple structural similarity
+    mu1 = cv2.GaussianBlur(img1.astype(np.float64), (11, 11), 1.5)
+    mu2 = cv2.GaussianBlur(img2.astype(np.float64), (11, 11), 1.5)
+    
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
+    mu1_mu2 = mu1 * mu2
+    
+    sigma1_sq = cv2.GaussianBlur(img1.astype(np.float64) * img1.astype(np.float64), (11, 11), 1.5) - mu1_sq
+    sigma2_sq = cv2.GaussianBlur(img2.astype(np.float64) * img2.astype(np.float64), (11, 11), 1.5) - mu2_sq
+    sigma12 = cv2.GaussianBlur(img1.astype(np.float64) * img2.astype(np.float64), (11, 11), 1.5) - mu1_mu2
+    
+    C1 = (0.01 * 255) ** 2
+    C2 = (0.03 * 255) ** 2
+    
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return np.mean(ssim_map)
+
+def calculate_mse(img1, img2):
+    """Calculate Mean Squared Error"""
+    return np.mean((img1 - img2) ** 2)
 
 # Lightweight fallback functions without PyTorch
 def simple_gaussian_filter(image, sigma=1.0):
@@ -196,9 +236,13 @@ class LightweightEvaluator:
             if original.shape != enhanced.shape:
                 enhanced = cv2.resize(enhanced, (original.shape[1], original.shape[0]))
             
-            psnr_val = psnr(original, enhanced, data_range=1.0)
-            ssim_val = ssim(original, enhanced, data_range=1.0)
-            mse_val = mean_squared_error(original, enhanced)
+            # Normalize images to 0-255 range for metrics
+            original_255 = (original * 255).astype(np.uint8)
+            enhanced_255 = (enhanced * 255).astype(np.uint8)
+            
+            psnr_val = calculate_psnr(original_255, enhanced_255)
+            ssim_val = calculate_ssim_simple(original_255, enhanced_255)
+            mse_val = calculate_mse(original, enhanced)
             rmse_val = np.sqrt(mse_val)
             
             # Convert RMSE to Kelvin
